@@ -2,6 +2,7 @@
 
 #include <setjmp.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,15 +33,15 @@
 /* Represent allocated blocks as doubly-linked list, with
  * next and prev pointers at beginning
  */
-typedef struct BELE {
-    struct BELE *next, *prev;
+typedef struct __block_element {
+    struct __block_element *next, *prev;
     size_t payload_size;
     size_t magic_header; /* Marker to see if block seems legitimate */
     unsigned char payload[0];
     /* Also place magic number at tail of every block */
-} block_ele_t;
+} block_element_t;
 
-static block_ele_t *allocated = NULL;
+static block_element_t *allocated = NULL;
 static size_t allocated_count = 0;
 
 /* Percent probability of malloc failure */
@@ -58,6 +59,12 @@ static jmp_buf env;
 static volatile sig_atomic_t jmp_ready = false;
 static bool time_limited = false;
 
+/* For test_malloc and test_calloc */
+typedef enum {
+    TEST_MALLOC,
+    TEST_CALLOC,
+} alloc_t;
+
 /* Internal functions */
 
 /* Should this allocation fail? */
@@ -70,17 +77,18 @@ static bool fail_allocation()
 /* Find header of block, given its payload.
  * Signal error if doesn't seem like legitimate block
  */
-static block_ele_t *find_header(void *p)
+static block_element_t *find_header(void *p)
 {
     if (!p) {
         report_event(MSG_ERROR, "Attempting to free null block");
         error_occurred = true;
     }
 
-    block_ele_t *b = (block_ele_t *) ((size_t) p - sizeof(block_ele_t));
+    block_element_t *b =
+        (block_element_t *) ((size_t) p - sizeof(block_element_t));
     if (cautious_mode) {
         /* Make sure this is really an allocated block */
-        block_ele_t *ab = allocated;
+        block_element_t *ab = allocated;
         bool found = false;
         while (ab && !found) {
             found = ab == b;
@@ -106,29 +114,36 @@ static block_ele_t *find_header(void *p)
 }
 
 /* Given pointer to block, find its footer */
-static size_t *find_footer(block_ele_t *b)
+static size_t *find_footer(block_element_t *b)
 {
     // cppcheck-suppress nullPointerRedundantCheck
-    size_t *p = (size_t *) ((size_t) b + b->payload_size + sizeof(block_ele_t));
+    size_t *p =
+        (size_t *) ((size_t) b + b->payload_size + sizeof(block_element_t));
     return p;
 }
 
-/* Implementation of application functions */
-
-void *test_malloc(size_t size)
+static void *alloc(alloc_t alloc_type, size_t size)
 {
     if (noallocate_mode) {
-        report_event(MSG_FATAL, "Calls to malloc disallowed");
+        char *msg_alloc_forbidden[] = {
+            "Calls to malloc are disallowed",
+            "Calls to calloc are disallowed",
+        };
+        report_event(MSG_FATAL, "%s", msg_alloc_forbidden[alloc_type]);
         return NULL;
     }
 
     if (fail_allocation()) {
-        report_event(MSG_WARN, "Malloc returning NULL");
+        char *msg_alloc_failure[] = {
+            "Malloc returning NULL",
+            "Calloc returning NULL",
+        };
+        report_event(MSG_WARN, "%s", msg_alloc_failure[alloc_type]);
         return NULL;
     }
 
-    block_ele_t *new_block =
-        malloc(size + sizeof(block_ele_t) + sizeof(size_t));
+    block_element_t *new_block =
+        malloc(size + sizeof(block_element_t) + sizeof(size_t));
     if (!new_block) {
         report_event(MSG_FATAL, "Couldn't allocate any more memory");
         error_occurred = true;
@@ -140,7 +155,7 @@ void *test_malloc(size_t size)
     new_block->payload_size = size;
     *find_footer(new_block) = MAGICFOOTER;
     void *p = (void *) &new_block->payload;
-    memset(p, FILLCHAR, size);
+    memset(p, !alloc_type * FILLCHAR, size);
     // cppcheck-suppress nullPointerRedundantCheck
     new_block->next = allocated;
     // cppcheck-suppress nullPointerRedundantCheck
@@ -154,16 +169,22 @@ void *test_malloc(size_t size)
     return p;
 }
 
+/* Implementation of application functions */
+
+void *test_malloc(size_t size)
+{
+    return alloc(TEST_MALLOC, size);
+}
+
 // cppcheck-suppress unusedFunction
 void *test_calloc(size_t nelem, size_t elsize)
 {
     /* Reference: Malloc tutorial
      * https://danluu.com/malloc-tutorial/
      */
-    size_t size = nelem * elsize;  // TODO: check for overflow
-    void *ptr = test_malloc(size);
-    memset(ptr, 0, size);
-    return ptr;
+    if (!nelem || !elsize || nelem > SIZE_MAX / elsize)
+        return NULL;
+    return alloc(TEST_CALLOC, nelem * elsize);
 }
 
 void test_free(void *p)
@@ -176,7 +197,7 @@ void test_free(void *p)
     if (!p)
         return;
 
-    block_ele_t *b = find_header(p);
+    block_element_t *b = find_header(p);
     size_t footer = *find_footer(b);
     if (footer != MAGICFOOTER) {
         report_event(MSG_ERROR,
@@ -190,8 +211,8 @@ void test_free(void *p)
     memset(p, FILLCHAR, b->payload_size);
 
     /* Unlink from list */
-    block_ele_t *bn = b->next;
-    block_ele_t *bp = b->prev;
+    block_element_t *bn = b->next;
+    block_element_t *bp = b->prev;
     if (bp)
         bp->next = bn;
     else
